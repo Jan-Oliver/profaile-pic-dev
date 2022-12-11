@@ -46,7 +46,7 @@ def parse_args(input_args=None):
     parser.add_argument(
         "--pretrained_vae_name_or_path",
         type=str,
-        default=None,
+        default="stabilityai/sd-vae-ft-mse",
         help="Path to pretrained vae or vae identifier from huggingface.co/models.",
     )
     parser.add_argument(
@@ -213,15 +213,10 @@ def parse_args(input_args=None):
     parser.add_argument("--adam_beta2", type=float, default=0.999, help="The beta2 parameter for the Adam optimizer.")
     parser.add_argument("--adam_weight_decay", type=float, default=1e-2, help="Weight decay to use.")
     parser.add_argument("--adam_epsilon", type=float, default=1e-08, help="Epsilon value for the Adam optimizer")
-    parser.add_argument("--max_grad_norm", default=1.0, type=float, help="Max gradient norm.")
-    parser.add_argument("--push_to_hub", action="store_true", help="Whether or not to push the model to the Hub.")
-    parser.add_argument("--hub_token", type=str, default=None, help="The token to use to push to the Model Hub.")
-    parser.add_argument(
-        "--hub_model_id",
-        type=str,
-        default=None,
-        help="The name of the repository to keep in sync with the local `output_dir`.",
-    )
+    #parser.add_argument("--max_grad_norm", default=1.0, type=float, help="Max gradient norm.")
+    #parser.add_argument("--push_to_hub", action="store_true", help="Whether or not to push the model to the Hub.")
+    #parser.add_argument("--hub_token", type=str, default=None, help="The token to use to push to the Model Hub.")
+    #parser.add_argument("--hub_model_id",type=str,default=None,help="The name of the repository to keep in sync with the local `output_dir`.",)
     parser.add_argument(
         "--logging_dir",
         type=str,
@@ -463,9 +458,9 @@ def main(args):
                     pipeline = StableDiffusionPipeline.from_pretrained(
                         args.pretrained_model_name_or_path,
                         vae=AutoencoderKL.from_pretrained(
-                            args.pretrained_vae_name_or_path or args.pretrained_model_name_or_path,
-                            subfolder=None if args.pretrained_vae_name_or_path else "vae",
-                            revision=None if args.pretrained_vae_name_or_path else args.revision,
+                            args.pretrained_vae_name_or_path,
+                            subfolder=None,
+                            revision=None,
                             torch_dtype=torch_dtype
                         ),
                         torch_dtype=torch_dtype,
@@ -703,9 +698,9 @@ def main(args):
                 unet=accelerator.unwrap_model(unet),
                 text_encoder=text_enc_model,
                 vae=AutoencoderKL.from_pretrained(
-                    args.pretrained_vae_name_or_path or args.pretrained_model_name_or_path,
-                    subfolder=None if args.pretrained_vae_name_or_path else "vae",
-                    revision=None if args.pretrained_vae_name_or_path else args.revision,
+                    args.pretrained_vae_name_or_path,
+                    subfolder=None,
+                    revision=None,
                 ),
                 safety_checker=None,
                 scheduler=scheduler,
