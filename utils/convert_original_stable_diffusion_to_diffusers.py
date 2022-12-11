@@ -12,8 +12,8 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
-
 # Source: https://github.com/lawfordp2017/diffusers/blob/main/scripts/convert_original_stable_diffusion_to_diffusers.py
+
 """ Conversion script for the LDM checkpoints. """
 
 import argparse

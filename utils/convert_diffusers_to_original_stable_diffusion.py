@@ -1,7 +1,6 @@
 # Script for converting a HF Diffusers saved pipeline to a Stable Diffusion checkpoint.
 # *Only* converts the UNet, VAE, and Text Encoder.
 # Does not convert optimizer state or any other thing.
-
 # Source: https://github.com/lawfordp2017/diffusers/blob/main/scripts/convert_diffusers_to_original_stable_diffusion.py
 
 import argparse
