@@ -12,8 +12,6 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
-# Source: https://github.com/lawfordp2017/diffusers/blob/main/scripts/convert_original_stable_diffusion_to_diffusers.py
-
 """ Conversion script for the LDM checkpoints. """
 
 import argparse
@@ -35,7 +33,6 @@ from diffusers import (
     DPMSolverMultistepScheduler,
     EulerAncestralDiscreteScheduler,
     EulerDiscreteScheduler,
-    HeunDiscreteScheduler,
     LDMTextToImagePipeline,
     LMSDiscreteScheduler,
     PNDMScheduler,
@@ -760,7 +757,7 @@ if __name__ == "__main__":
     parser.add_argument(
         "--prediction_type",
         default=None,
-        type=int,
+        type=str,
         help=(
             "The prediction type that the model was trained on. Use 'epsilon' for Stable Diffusion v1.X and Stable"
             " Siffusion v2 Base. Use 'v-prediction' for Stable Diffusion v2."
@@ -782,7 +779,6 @@ if __name__ == "__main__":
     prediction_type = args.prediction_type
 
     checkpoint = torch.load(args.checkpoint_path)
-    global_step = checkpoint["global_step"]
     checkpoint = checkpoint["state_dict"]
 
     if args.original_config_file is None:
@@ -810,11 +806,11 @@ if __name__ == "__main__":
         if prediction_type is None:
             # NOTE: For stable diffusion 2 base it is recommended to pass `prediction_type=="epsilon"`
             # as it relies on a brittle global step parameter here
-            prediction_type = "epsilon" if global_step == 875000 else "v_prediction"
+            prediction_type = "v_prediction"
         if image_size is None:
             # NOTE: For stable diffusion 2 base one has to pass `image_size==512`
             # as it relies on a brittle global step parameter here
-            image_size = 512 if global_step == 875000 else 768
+            image_size = 512
     else:
         if prediction_type is None:
             prediction_type = "epsilon"
@@ -850,8 +846,6 @@ if __name__ == "__main__":
         scheduler = PNDMScheduler.from_config(config)
     elif args.scheduler_type == "lms":
         scheduler = LMSDiscreteScheduler.from_config(scheduler.config)
-    elif args.scheduler_type == "heun":
-        scheduler = HeunDiscreteScheduler.from_config(scheduler.config)
     elif args.scheduler_type == "euler":
         scheduler = EulerDiscreteScheduler.from_config(scheduler.config)
     elif args.scheduler_type == "euler-ancestral":
