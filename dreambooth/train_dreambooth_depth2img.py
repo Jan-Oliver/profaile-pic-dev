@@ -46,6 +46,20 @@ def parse_args(input_args=None):
         help="Path to pretrained model or model identifier from huggingface.co/models.",
     )
     parser.add_argument(
+        "--pretrained_model_name_or_path_class_images",
+        type=str,
+        default="stabilityai/stable-diffusion-2-base",
+        required=True,
+        help="Path to pretrained model or model identifier from huggingface.co/models to generate class images.",
+    )
+    parser.add_argument(
+        "--pretrained_model_feature_extraction_path",
+        type=str,
+        default="/content/stable-diffusion-2-depth/feature_extractor",
+        required=True,
+        help="Bugfix: Path to feature_extractor subfolder to instantiate the corresponding model which fails otherwise.",
+    )
+    parser.add_argument(
         "--pretrained_vae_name_or_path",
         type=str,
         default="stabilityai/sd-vae-ft-mse",
@@ -55,7 +69,7 @@ def parse_args(input_args=None):
         "--revision",
         type=str,
         # ADAPTION: Changed this to "fp16"
-        default=None,
+        default="fp16",
         required=False,
         help="Revision of pretrained model identifier from huggingface.co/models.",
     )
@@ -470,8 +484,9 @@ def main(args):
                 if pipeline is None:
                     # ADAPTED: Changed StableDiffusionPipeline to StableDiffusionDepth2ImgPipeline
                     # UNDO: We don't want to use depth when creating random images for prior preservation!
+                    # ADAPTED: Added other pretrained model path as we don't want the depth model here
                     pipeline = StableDiffusionPipeline.from_pretrained(
-                        args.pretrained_model_name_or_path,
+                        args.pretrained_model_name_or_path_class_images,
                         vae=AutoencoderKL.from_pretrained(
                             args.pretrained_vae_name_or_path,
                             subfolder=None,
@@ -548,11 +563,7 @@ def main(args):
     )
     # ADAPTED: Added feature extractor and depth estimator
     # Check repo structure here: https://huggingface.co/stabilityai/stable-diffusion-2-depth/tree/main
-    feature_extractor = DPTFeatureExtractor.from_pretrained(
-        args.pretrained_model_name_or_path,
-        subfolder="feature_extractor",
-        revision=args.revision,
-    )
+    feature_extractor = DPTFeatureExtractor.from_pretrained(args.pretrained_model_feature_extraction_path)
 
     depth_estimator = DPTForDepthEstimation.from_pretrained(
         args.pretrained_model_name_or_path,
