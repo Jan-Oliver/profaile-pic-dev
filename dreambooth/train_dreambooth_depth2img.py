@@ -252,11 +252,10 @@ def parse_args(input_args=None):
     parser.add_argument("--log_interval", type=int, default=10, help="Log every N steps.")
     parser.add_argument("--save_interval", type=int, default=10_000, help="Save weights every N steps.")
     parser.add_argument("--save_min_steps", type=int, default=0, help="Start saving weights after N steps.")
-    parser.add_argument(
-        "--mixed_precision",
+    parser.add_argument("--mixed_precision",
         type=str,
         # ADAPTION: Changed this to "fp16"
-        default="None",
+        default="no",
         choices=["no", "fp16", "bf16"],
         help=(
             "Whether to use mixed precision. Choose between fp16 and bf16 (bfloat16). Bf16 requires PyTorch >="
@@ -310,13 +309,16 @@ class DreamBoothDataset(Dataset):
         center_crop=False,
         num_class_images=None,
         pad_tokens=False,
-        hflip=False
+        hflip=False,
+        feature_extractor = None
     ):
         self.size = size
         self.center_crop = center_crop
         self.tokenizer = tokenizer
         self.with_prior_preservation = with_prior_preservation
         self.pad_tokens = pad_tokens
+        
+        self.feature_extractor = feature_extractor
 
         self.instance_images_path = []
         self.class_images_path = []
@@ -334,7 +336,7 @@ class DreamBoothDataset(Dataset):
         self.num_class_images = len(self.class_images_path)
         self._length = max(self.num_class_images, self.num_instance_images)
 
-        self.image_transforms = transforms.Compose(
+        """self.image_transforms = transforms.Compose(
             [
                 transforms.RandomHorizontalFlip(0.5 * hflip),
                 transforms.Resize(size, interpolation=transforms.InterpolationMode.BILINEAR),
@@ -342,8 +344,30 @@ class DreamBoothDataset(Dataset):
                 transforms.ToTensor(),
                 transforms.Normalize([0.5], [0.5]),
             ]
-        )
+        )"""
+    
+    def preprocess(self, image):
+        import numpy as np
+        from diffusers.utils import PIL_INTERPOLATION
 
+        if isinstance(image, torch.Tensor):
+            return image
+        elif isinstance(image, PIL.Image.Image):
+            image = [image]
+
+        if isinstance(image[0], PIL.Image.Image):
+            w, h = image[0].size
+            w, h = map(lambda x: x - x % 32, (w, h))  # resize to integer multiple of 32
+            image = [np.array(i.resize((w, h), resample=PIL_INTERPOLATION["lanczos"]))[None, :] for i in image]
+            image = np.concatenate(image, axis=0)
+            image = np.array(image).astype(np.float32) / 255.0
+            image = image.transpose(0, 3, 1, 2)
+            image = 2.0 * image - 1.0
+            image = torch.from_numpy(image)
+        elif isinstance(image[0], torch.Tensor):
+            image = torch.cat(image, dim=0)
+        return image
+    
     def __len__(self):
         return self._length
 
@@ -353,9 +377,12 @@ class DreamBoothDataset(Dataset):
         instance_image = Image.open(instance_path)
         if not instance_image.mode == "RGB":
             instance_image = instance_image.convert("RGB")
-        example["instance_images"] = self.image_transforms(instance_image)
+
         # ADAPTED: Added not transformed instance image
-        example["instance_images_not_transformed"] = instance_image
+        depth_map_pixel_values = self.feature_extractor(images=instance_image, return_tensors="pt").pixel_values[0]
+
+        example["instance_images"] = self.preprocess(instance_image)[0]
+        example["instance_depth_maps"] = depth_map_pixel_values
         example["instance_prompt_ids"] = self.tokenizer(
             instance_prompt,
             padding="max_length" if self.pad_tokens else "do_not_pad",
@@ -368,8 +395,11 @@ class DreamBoothDataset(Dataset):
             class_image = Image.open(class_path)
             if not class_image.mode == "RGB":
                 class_image = class_image.convert("RGB")
-            example["class_images"] = self.image_transforms(class_image)
-            example["class_images_not_transformed"] = class_image
+
+            depth_map_pixel_values = self.feature_extractor(images=class_image, return_tensors="pt").pixel_values[0]
+
+            example["class_images"] = self.preprocess(class_image)[0]
+            example["class_depth_maps"] = depth_map_pixel_values
             example["class_prompt_ids"] = self.tokenizer(
                 class_prompt,
                 padding="max_length" if self.pad_tokens else "do_not_pad",
@@ -398,16 +428,16 @@ class PromptDataset(Dataset):
 
 
 class LatentsDataset(Dataset):
-    def __init__(self, latents_cache, text_encoder_cache, not_transformed_images_cache):
+    def __init__(self, latents_cache, text_encoder_cache, depth_maps_cache):
         self.latents_cache = latents_cache
         self.text_encoder_cache = text_encoder_cache
-        self.not_transformed_images_cache = not_transformed_images_cache
+        self.depth_maps_cache = depth_maps_cache
 
     def __len__(self):
         return len(self.latents_cache)
 
     def __getitem__(self, index):
-        return self.latents_cache[index], self.text_encoder_cache[index], self.not_transformed_images_cache[index]
+        return self.latents_cache[index], self.text_encoder_cache[index], self.depth_maps_cache[index]
 
 
 class AverageMeter:
@@ -531,6 +561,11 @@ def main(args):
         if torch.cuda.is_available():
             torch.cuda.empty_cache()
 
+    # Get Width and Height of images
+    filename = os.listdir(class_images_dir)[0]
+    image = Image.open(os.path.join(class_images_dir, filename))
+    WIDTH, HEIGHT = image.size
+        
     # Load the tokenizer
     if args.tokenizer_name:
         tokenizer = CLIPTokenizer.from_pretrained(
@@ -621,63 +656,24 @@ def main(args):
         center_crop=args.center_crop,
         num_class_images=args.num_class_images,
         pad_tokens=args.pad_tokens,
-        hflip=args.hflip
+        hflip=args.hflip,
+        feature_extractor=feature_extractor
     )
-
-    def collate_fn(examples):
-        input_ids = [example["instance_prompt_ids"] for example in examples]
-        pixel_values = [example["instance_images"] for example in examples]
-        # ADAPTED: Added this
-        pixel_values_not_transformed = [example["instance_images_not_transformed"] for example in examples]
-        
-        # Concat class and instance examples for prior preservation.
-        # We do this to avoid doing two forward passes.
-        if args.with_prior_preservation:
-            input_ids += [example["class_prompt_ids"] for example in examples]
-            pixel_values += [example["class_images"] for example in examples]
-            pixel_values_not_transformed += [example["class_images_not_transformed"] for example in examples]
-
-        pixel_values = torch.stack(pixel_values)
-        pixel_values = pixel_values.to(memory_format=torch.contiguous_format).float()
-
-        pixel_values_not_transformed = torch.stack(pixel_values_not_transformed)
-        pixel_values_not_transformed = pixel_values_not_transformed.to(memory_format=torch.contiguous_format).float()
-
-        input_ids = tokenizer.pad(
-            {"input_ids": input_ids},
-            padding=True,
-            return_tensors="pt",
-        ).input_ids
-
-        batch = {
-            "input_ids": input_ids,
-            "pixel_values": pixel_values,
-            "pixel_values_not_transformed": pixel_values_not_transformed
-        }
-        return batch
 
     # ADAPTION: Added this to calculate depth map
     # ADAPTION: Removed parameter do_classifier_free_guidance
-    def prepare_depth_map(image, depth_map, batch_size, dtype, device):
-        if isinstance(image, PIL.Image.Image):
-            width, height = image.size
-            width, height = map(lambda dim: dim - dim % 32, (width, height))  # resize to integer multiple of 32
-            image = image.resize((width, height), resample=PIL_INTERPOLATION["lanczos"])
-            width, height = image.size
-        else:
-            image = [img for img in image]
-            width, height = image[0].shape[-2:]
+    def prepare_depth_map(pixel_values, depth_map, device, dtype, width, height):
 
         if depth_map is None:
-            pixel_values = feature_extractor(images=image, return_tensors="pt").pixel_values
-            pixel_values = pixel_values.to(device=device)
+            #pixel_values = feature_extractor(images=image, return_tensors="pt").pixel_values
+            #pixel_values = pixel_values.to(device=device)
             # The DPT-Hybrid model uses batch-norm layers which are not compatible with fp16.
             # So we use `torch.autocast` here for half precision inference.
             context_manger = torch.autocast("cuda", dtype=dtype) if device.type == "cuda" else contextlib.nullcontext()
             with context_manger:
                 depth_map = depth_estimator(pixel_values).predicted_depth
         else:
-            depth_map = depth_map.to(device=device, dtype=dtype)
+            depth_map = depth_map.to(dtype=dtype)
 
         depth_map = torch.nn.functional.interpolate(
             depth_map.unsqueeze(1),
@@ -692,23 +688,54 @@ def main(args):
         depth_map = depth_map.to(dtype)
 
         # duplicate mask and masked_image_latents for each generation per prompt, using mps friendly method
-        if depth_map.shape[0] < batch_size:
-            depth_map = depth_map.repeat(batch_size, 1, 1, 1)
+        #if depth_map.shape[0] < batch_size: total_batch_size
+        #    depth_map = depth_map.repeat(batch_size, 1, 1, 1)
 
         # ADAPTION: Comment out following line as I removed do_classifier_free_guidance
         # depth_map = torch.cat([depth_map] * 2) if do_classifier_free_guidance else depth_map
         return depth_map
-
-    # ADAPTED: num_workers
-    train_dataloader = torch.utils.data.DataLoader(
-        train_dataset, batch_size=args.train_batch_size, shuffle=True, collate_fn=collate_fn, pin_memory=True, num_workers=8
-    )
-
+    
     weight_dtype = torch.float32
     if args.mixed_precision == "fp16":
         weight_dtype = torch.float16
     elif args.mixed_precision == "bf16":
         weight_dtype = torch.bfloat16
+
+    def collate_fn(examples):
+        input_ids = [example["instance_prompt_ids"] for example in examples]
+        pixel_values = [example["instance_images"] for example in examples]
+        depth_maps = [example["instance_depth_maps"] for example in examples]
+
+        # Concat class and instance examples for prior preservation.
+        # We do this to avoid doing two forward passes.
+        if args.with_prior_preservation:
+            input_ids += [example["class_prompt_ids"] for example in examples]
+            pixel_values += [example["class_images"] for example in examples]
+            depth_maps += [example["class_depth_maps"] for example in examples]
+
+        pixel_values = torch.stack(pixel_values)
+        pixel_values = pixel_values.to(memory_format=torch.contiguous_format).float()
+
+        depth_maps = torch.stack(depth_maps)
+        depth_maps = depth_maps.to(memory_format=torch.contiguous_format).float()
+
+        input_ids = tokenizer.pad(
+            {"input_ids": input_ids},
+            padding=True,
+            return_tensors="pt",
+        ).input_ids
+
+        batch = {
+            "input_ids": input_ids,
+            "pixel_values": pixel_values,
+            "depth_maps": depth_maps
+        }
+        return batch
+
+    # ADAPTED: num_workers
+    train_dataloader = torch.utils.data.DataLoader(
+        train_dataset, batch_size=args.train_batch_size, shuffle=True, collate_fn=collate_fn, pin_memory=True, num_workers=8
+    )
 
     # Move text_encode and vae to gpu.
     # For mixed precision training we cast the text_encoder and vae weights to half-precision
@@ -718,27 +745,29 @@ def main(args):
         text_encoder.to(accelerator.device, dtype=weight_dtype)
 
     # ADAPTED: Also move feature_extractor and depth_estimator to gpu as we don't train them
-    feature_extractor.to(accelerator.device, dtype=weight_dtype)
+    #feature_extractor.to(accelerator.device, dtype=weight_dtype)
     depth_estimator.to(accelerator.device, dtype=weight_dtype)
 
     if not args.not_cache_latents:
         latents_cache = []
         text_encoder_cache = []
         # ADAPTED:
-        not_transformed_images_cache = []
+        depth_maps_cache = []
         for batch in tqdm(train_dataloader, desc="Caching latents"):
             with torch.no_grad():
                 batch["pixel_values"] = batch["pixel_values"].to(accelerator.device, non_blocking=True, dtype=weight_dtype)
                 batch["input_ids"] = batch["input_ids"].to(accelerator.device, non_blocking=True)
+                batch["depth_maps"] = batch["depth_maps"].to(accelerator.device, non_blocking=True, dtype=weight_dtype)
                 latents_cache.append(vae.encode(batch["pixel_values"]).latent_dist)
                 if args.train_text_encoder:
                     text_encoder_cache.append(batch["input_ids"])
                 else:
                     text_encoder_cache.append(text_encoder(batch["input_ids"])[0])
-                # ADAPTED: Add pixel_values_not_transformed here
-                not_transformed_images_cache.append(batch["pixel_values_not_transformed"])
-                
-        train_dataset = LatentsDataset(latents_cache, text_encoder_cache, not_transformed_images_cache)
+
+                # ADAPTED: Add depth_maps here
+                depth_maps_cache.append(prepare_depth_map(pixel_values=batch["depth_maps"], depth_map=None, device=accelerator.device, dtype=weight_dtype, width=WIDTH, height=HEIGHT))
+       
+        train_dataset = LatentsDataset(latents_cache, text_encoder_cache, depth_maps_cache)
         train_dataloader = torch.utils.data.DataLoader(train_dataset, batch_size=1, collate_fn=lambda x: x, shuffle=True)
 
         del vae
@@ -868,7 +897,9 @@ def main(args):
         if args.train_text_encoder:
             text_encoder.train()
         # ADAPTED: added random.shuffle statement
-        random.shuffle(train_dataset.class_images_path)
+        if args.not_cache_latents:
+            random.shuffle(train_dataset.class_images_path)
+        # TODO: Shuffle the other stuff?
         for step, batch in enumerate(train_dataloader):
             with accelerator.accumulate(unet):
                 # Convert images to latent space
@@ -891,18 +922,28 @@ def main(args):
                 noisy_latents = noise_scheduler.add_noise(latents, noise, timesteps)
 
                 # Output of prepare_latents
-                # ADAPTED: Added the following depth mask calculation 
-                print("Batch size: ", batch.shape[0])
-                depth_mask = prepare_depth_map(
-                    image=batch["pixel_values_not_transformed"].to(dtype=weight_dtype),
-                    depth_map=None,
-                    batch_size=args.train_batch_size,
-                    dtype=weight_dtype,
-                    device=noisy_latents.device,
-                )
+                # ADAPTED: Added the following depth mask calculation
+                # UNDO: Doesn't work to calculate depth map here:
+                # Problem -> We need image in pillow. But data loader cannot use pillow images but only tensors. 
+                #print("Batch size: ", batch.shape[0])
+                #depth_mask = prepare_depth_map(
+                #    image=batch["pixel_values_not_transformed"].to(dtype=weight_dtype),
+                #    depth_map=None,
+                #    batch_size=args.train_batch_size,
+                #    dtype=weight_dtype,
+                #    device=noisy_latents.device,
+                #)
                 
+                with torch.no_grad():
+                    if not args.not_cache_latents:
+                        depth_masks = batch[0][2]
+                    else:
+                        depth_masks = prepare_depth_map(pixel_values=batch["depth_maps"], depth_map=None, device=accelerator.device, dtype=weight_dtype, width=WIDTH, height=HEIGHT)                
+                
+                print("Latents shape: ", noisy_latents.shape)
+                print("Depth shape:", depth_masks.shape)
                 # Prepare depth mask using image, 
-                latent_model_input = torch.cat([noisy_latents, depth_mask], dim=1)
+                latent_model_input = torch.cat([noisy_latents, depth_masks], dim=1)
                 # Get the text embedding for conditioning
                 with text_enc_context:
                     if not args.not_cache_latents:
