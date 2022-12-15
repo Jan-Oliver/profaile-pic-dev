@@ -940,8 +940,6 @@ def main(args):
                     else:
                         depth_masks = prepare_depth_map(pixel_values=batch["depth_maps"], depth_map=None, device=accelerator.device, dtype=weight_dtype, width=WIDTH, height=HEIGHT)                
                 
-                print("Latents shape: ", noisy_latents.shape)
-                print("Depth shape:", depth_masks.shape)
                 # Prepare depth mask using image, 
                 latent_model_input = torch.cat([noisy_latents, depth_masks], dim=1)
                 # Get the text embedding for conditioning
