@@ -34,6 +34,7 @@ def parse_args(input_args=None):
         Example of how to call the train.py script:
         !accelerate launch train.py \
             # Parameters for where to find the different model fragments we need for training
+            --model_output_dir="<Directory where model should be stored at the end>" \
             --pretrained_depth_model_path="<Storage path of depth model e.g. S3 bucket>" \
             --pretrained_base_model_path="<Storage path of base model e.g. S3 bucket>" \
             --pretrained_vae_path="<Storage path of variational autoencoder model e.g. S3 bucket>" \
@@ -71,7 +72,7 @@ def parse_args(input_args=None):
     parser.add_argument(
         "--model_output_dir",
         type=str,
-        default=os.environ["SM_MODEL_DIR"],
+        default=None,
         help="The output directory where the model predictions and checkpoints will be written.",
     )
 
