@@ -1,12 +1,13 @@
-# Source: https://github.com/ShivamShrirao/diffusers
 import argparse
 import hashlib
 import itertools
+import contextlib
 import random
 import json
+import PIL
 import math
 import os
-import wandb
+import requests
 from contextlib import nullcontext
 from pathlib import Path
 from typing import Optional
@@ -17,183 +18,180 @@ import torch.utils.checkpoint
 from torch.utils.data import Dataset
 
 from accelerate import Accelerator
-from accelerate.logging import get_logger
 from accelerate.utils import set_seed
-from diffusers import AutoencoderKL, DDIMScheduler, DDPMScheduler, StableDiffusionPipeline, UNet2DConditionModel
+from diffusers import AutoencoderKL, StableDiffusionDepth2ImgPipeline, DDIMScheduler, DDPMScheduler, StableDiffusionPipeline, UNet2DConditionModel
 from diffusers.optimization import get_scheduler
 from huggingface_hub import HfFolder, Repository, whoami
 from PIL import Image
 from torchvision import transforms
 from tqdm.auto import tqdm
-from transformers import CLIPTextModel, CLIPTokenizer
-
-
+from transformers import CLIPTextModel, CLIPTokenizer, DPTFeatureExtractor, DPTForDepthEstimation
+from diffusers.utils.pil_utils import PIL_INTERPOLATION
 torch.backends.cudnn.benchmark = True
 
-
-logger = get_logger(__name__)
-
-
 def parse_args(input_args=None):
+    """ Parse arguments
+        Example of how to call the train.py script:
+        !accelerate launch train.py \
+            # Parameters for where to find the different model fragments we need for training
+            --model_output_dir="<Directory where model should be stored at the end>" \
+            --pretrained_depth_model_path="<Storage path of depth model e.g. S3 bucket>" \
+            --pretrained_base_model_path="<Storage path of base model e.g. S3 bucket>" \
+            --pretrained_vae_path="<Storage path of variational autoencoder model e.g. S3 bucket>" \
+            # Parameters for concept we want the model to learn
+            --instance_data_dir="<Storage path of training images e.g. S3 bucket>" \
+            --class_data_dir="<Storage path of class images e.g. S3 bucket>" \
+            --instance_prompt="Photo of xyz <Gender>" \
+            --class_prompt="Photo of <Gender>" \
+            # Parameters that define if prior preservation should be used and with how many class images
+            --with_prior_preservation \
+            --prior_loss_weight=1.0 \
+            --num_class_images=324 \
+            --class_batch_size=4 \
+            # Parameters that define the training
+            --seed=1337 \
+            --train_text_encoder \
+            --train_batch_size=1 \
+            --max_train_steps=3500 \
+            --learning_rate=1e-6 \
+            --lr_scheduler="constant" \
+            --lr_warmup_step=0 \
+            # Parameters for optimization of GPU usage
+            --gradient_accumulation_steps=1 \
+            --mixed_precision="fp16" \ <- Set to "no" for maximum precision, increases GPU VRAM usage
+            --gradient_checkpointing \ <- Remove for maximum precision, increases GPU VRAM usage
+            --use_8bit_adam \ <- Remove for maximum precision, increases GPU VRAM usage
+    """
     parser = argparse.ArgumentParser(description="Simple example of a training script.")
+
+    # AWS Sagemaker Params
+    # hyperparameters sent by the client are passed as command-line arguments to the script.
+    # For this script we don't need the default hyperparameters provided in the sagemaker examples.
+    # Output directory is where we will store the model into. This is the path that sagemaker expects the model to be.
+    # If we specify a different value in estimator.fit we will overwrite the environment variable.
     parser.add_argument(
-        "--pretrained_model_name_or_path",
+        "--model_output_dir",
         type=str,
-        default=None,
+        default="",#os.environ["SM_MODEL_DIR"],
+        help="The output directory where the model predictions and checkpoints will be written.",
+    )
+
+    parser.add_argument(
+        "--pretrained_depth_model_path",
+        type=str,
+        default="stabilityai/stable-diffusion-2-depth",
         required=True,
-        help="Path to pretrained model or model identifier from huggingface.co/models.",
+        help="Path to pretrained depth model in AWS S3 bucket: stabilityai/stable-diffusion-2-depth. This model will be finetuned",
     )
     parser.add_argument(
-        "--pretrained_vae_name_or_path",
+        "--pretrained_base_model_path",
+        type=str,
+        default="stabilityai/stable-diffusion-2-base",
+        required=True,
+        help="Path to pretrained base model in AWS S3 bucket: stabilityai/stable-diffusion-2-base. This model will be used to generate class images if they aren't yet created",
+    )
+    parser.add_argument(
+        "--pretrained_vae_path",
         type=str,
         default="stabilityai/sd-vae-ft-mse",
-        help="Path to pretrained vae or vae identifier from huggingface.co/models.",
+        help="Path to pretrained vae in AWS S3 bucket: stabilityai/sd-vae-ft-mse",
     )
+    # QUESTION: Can we remove this alltogether?
     parser.add_argument(
         "--revision",
         type=str,
-        default=None,
-        required=False,
+        default="fp16",
         help="Revision of pretrained model identifier from huggingface.co/models.",
     )
-    parser.add_argument(
-        "--tokenizer_name",
-        type=str,
-        default=None,
-        help="Pretrained tokenizer name or path if not the same as model_name",
-    )
+
+    # Defines the directories where the class and instance images are stored.
+    # Also defines the text input (prompt) that is fed into the model together with the class / instance images
     parser.add_argument(
         "--instance_data_dir",
         type=str,
-        default=None,
+        default="", #os.environ["SM_CHANNEL_TRAINING"],
         help="A folder containing the training data of instance images.",
     )
+
     parser.add_argument(
         "--class_data_dir",
         type=str,
-        default=None,
+        default="", #os.environ["SM_CHANNEL_TESTING"],
         help="A folder containing the training data of class images.",
     )
+
     parser.add_argument(
         "--instance_prompt",
         type=str,
         default=None,
         help="The prompt with identifier specifying the instance",
     )
+
     parser.add_argument(
         "--class_prompt",
         type=str,
         default=None,
         help="The prompt to specify images in the same class as provided instance images.",
     )
-    parser.add_argument(
-        "--save_sample_prompt",
-        type=str,
-        default=None,
-        help="The prompt used to generate sample outputs to save.",
-    )
-    parser.add_argument(
-        "--save_sample_negative_prompt",
-        type=str,
-        default=None,
-        help="The negative prompt used to generate sample outputs to save.",
-    )
-    parser.add_argument(
-        "--n_save_sample",
-        type=int,
-        default=4,
-        help="The number of samples to save.",
-    )
-    parser.add_argument(
-        "--save_guidance_scale",
-        type=float,
-        default=7.5,
-        help="CFG for save sample.",
-    )
-    parser.add_argument(
-        "--save_infer_steps",
-        type=int,
-        default=50,
-        help="The number of inference steps for save sample.",
-    )
-    parser.add_argument(
-        "--pad_tokens",
-        default=False,
-        action="store_true",
-        help="Flag to pad tokens to length 77.",
-    )
+    # Parameters for Prior Preservation
+    # Allows to keep the prior of the model
     parser.add_argument(
         "--with_prior_preservation",
-        default=False,
-        action="store_true",
+        default=True,
+        type=bool,
         help="Flag to add prior preservation loss.",
     )
-    parser.add_argument("--prior_loss_weight", type=float, default=1.0, help="The weight of prior preservation loss.")
+    parser.add_argument(
+        "--prior_loss_weight",
+        type=float, 
+        default=1.0, 
+        help="The weight of prior preservation loss."
+    )
     parser.add_argument(
         "--num_class_images",
         type=int,
         default=100,
         help=(
             "Minimal class images for prior preservation loss. If not have enough images, additional images will be"
-            " sampled with class_prompt."
-        ),
+            " sampled with class_prompt."),
     )
     parser.add_argument(
-        "--output_dir",
-        type=str,
-        default="text-inversion-model",
-        help="The output directory where the model predictions and checkpoints will be written.",
+        "--class_batch_size", 
+        type=int, default=4, help="Batch size (per device) for sampling images."
     )
-    parser.add_argument("--seed", type=int, default=None, help="A seed for reproducible training.")
+    
+    # Training specific hyperparameters
     parser.add_argument(
-        "--resolution",
-        type=int,
-        default=512,
-        help=(
-            "The resolution for input images, all the images in the train/validation dataset will be resized to this"
-            " resolution"
-        ),
+        "--seed", 
+        type=int, 
+        default=999, 
+        help="A seed for reproducible training."
     )
     parser.add_argument(
-        "--center_crop", action="store_true", help="Whether to center crop images before resizing to resolution"
+        "--train_text_encoder",
+        default=True,
+        type=bool,
+        help="Whether to train the text encoder or not. If argument is added the text encoder will also be trained."
     )
-    parser.add_argument("--train_text_encoder", action="store_true", help="Whether to train the text encoder")
     parser.add_argument(
-        "--train_batch_size", type=int, default=4, help="Batch size (per device) for the training dataloader."
+        "--train_batch_size",
+        type=int, 
+        default=4, 
+        help="Batch size (per device) for the training dataloader."
     )
-    parser.add_argument(
-        "--sample_batch_size", type=int, default=4, help="Batch size (per device) for sampling images."
-    )
-    parser.add_argument("--num_train_epochs", type=int, default=1)
     parser.add_argument(
         "--max_train_steps",
         type=int,
-        default=None,
-        help="Total number of training steps to perform.  If provided, overrides num_train_epochs.",
-    )
-    parser.add_argument(
-        "--gradient_accumulation_steps",
-        type=int,
-        default=1,
-        help="Number of updates steps to accumulate before performing a backward/update pass.",
-    )
-    parser.add_argument(
-        "--gradient_checkpointing",
-        action="store_true",
-        help="Whether or not to use gradient checkpointing to save memory at the expense of slower backward pass.",
+        default=3500,
+        help="Total number of training steps to perform",
     )
     parser.add_argument(
         "--learning_rate",
         type=float,
-        default=5e-6,
+        default=1e-6,
         help="Initial learning rate (after the potential warmup period) to use.",
     )
-    parser.add_argument(
-        "--scale_lr",
-        action="store_true",
-        default=False,
-        help="Scale the learning rate by the number of GPUs, gradient accumulation steps, and batch size.",
-    )
+
     parser.add_argument(
         "--lr_scheduler",
         type=str,
@@ -204,35 +202,42 @@ def parse_args(input_args=None):
         ),
     )
     parser.add_argument(
-        "--lr_warmup_steps", type=int, default=500, help="Number of steps for the warmup in the lr scheduler."
+        "--lr_warmup_steps", 
+        type=int, 
+        default=0, 
+        help="Number of steps for the warmup in the lr scheduler."
+    )
+
+    # Hyperparameters for optimization regarding GPU usage
+    parser.add_argument(
+        "--gradient_accumulation_steps",
+        type=int,
+        default=1,
+        help="Number of updates steps to accumulate before performing a backward/update pass.",
     )
     parser.add_argument(
-        "--use_8bit_adam", action="store_true", help="Whether or not to use 8-bit Adam from bitsandbytes."
+        "--gradient_checkpointing",
+        default=False,
+        type=bool,
+        help="Whether or not to use gradient checkpointing to save memory at the expense of slower backward pass.",
     )
-    parser.add_argument("--adam_beta1", type=float, default=0.9, help="The beta1 parameter for the Adam optimizer.")
-    parser.add_argument("--adam_beta2", type=float, default=0.999, help="The beta2 parameter for the Adam optimizer.")
-    parser.add_argument("--adam_weight_decay", type=float, default=1e-2, help="Weight decay to use.")
-    parser.add_argument("--adam_epsilon", type=float, default=1e-08, help="Epsilon value for the Adam optimizer")
-    #parser.add_argument("--max_grad_norm", default=1.0, type=float, help="Max gradient norm.")
-    #parser.add_argument("--push_to_hub", action="store_true", help="Whether or not to push the model to the Hub.")
-    #parser.add_argument("--hub_token", type=str, default=None, help="The token to use to push to the Model Hub.")
-    #parser.add_argument("--hub_model_id",type=str,default=None,help="The name of the repository to keep in sync with the local `output_dir`.",)
     parser.add_argument(
-        "--logging_dir",
-        type=str,
-        default="logs",
-        help=(
-            "[TensorBoard](https://www.tensorflow.org/tensorboard) log directory. Will default to"
-            " *output_dir/runs/**CURRENT_DATETIME_HOSTNAME***."
-        ),
+        "--use_8bit_adam", 
+        default=False,
+        type=bool,
+        help="Whether or not to use 8-bit Adam from bitsandbytes."
     )
-    parser.add_argument("--log_interval", type=int, default=10, help="Log every N steps.")
-    parser.add_argument("--save_interval", type=int, default=10_000, help="Save weights every N steps.")
-    parser.add_argument("--save_min_steps", type=int, default=0, help="Start saving weights after N steps.")
+
+    parser.add_argument(
+        "--log_interval", 
+        type=int, 
+        default=10, 
+        help="Log every N steps."
+    )
     parser.add_argument(
         "--mixed_precision",
         type=str,
-        default=None,
+        default="no",
         choices=["no", "fp16", "bf16"],
         help=(
             "Whether to use mixed precision. Choose between fp16 and bf16 (bfloat16). Bf16 requires PyTorch >="
@@ -240,37 +245,19 @@ def parse_args(input_args=None):
             " flag passed with the `accelerate.launch` command. Use this argument to override the accelerate config."
         ),
     )
-    parser.add_argument("--not_cache_latents", action="store_true", help="Do not precompute and cache latents from VAE.")
-    parser.add_argument("--hflip", action="store_true", help="Apply horizontal flip data augmentation.")
-    parser.add_argument("--local_rank", type=int, default=-1, help="For distributed training: local_rank")
     parser.add_argument(
-        "--concepts_list",
-        type=str,
-        default=None,
-        help="Path to json containing multiple concepts, will overwrite parameters like instance_prompt, class_prompt, etc.",
+        "--not_cache_latents", 
+        default=False,
+        type=bool,
+        help="Do not precompute and cache latents from VAE."
     )
-    parser.add_argument(
-        "--wandb_group_name",
-        type=str,
-        default=None,
-        help="Group name to combine multiple wandb processes in the GUI."
-    )
-    parser.add_argument(
-        "--wandb_project_name",
-        type=str,
-        default=None,
-        help="Project name to combine multiple wandb processes in the GUI."
-    )
+
     if input_args is not None:
         args = parser.parse_args(input_args)
     else:
         args = parser.parse_args()
 
-    env_local_rank = int(os.environ.get("LOCAL_RANK", -1))
-    if env_local_rank != -1 and env_local_rank != args.local_rank:
-        args.local_rank = env_local_rank
     return args
-
 
 class DreamBoothDataset(Dataset):
     """
@@ -280,47 +267,54 @@ class DreamBoothDataset(Dataset):
 
     def __init__(
         self,
-        concepts_list,
         tokenizer,
+        concept,
         with_prior_preservation=True,
-        size=512,
-        center_crop=False,
         num_class_images=None,
-        pad_tokens=False,
-        hflip=False
+        feature_extractor = None
     ):
-        self.size = size
-        self.center_crop = center_crop
         self.tokenizer = tokenizer
         self.with_prior_preservation = with_prior_preservation
-        self.pad_tokens = pad_tokens
+        
+        self.feature_extractor = feature_extractor
 
         self.instance_images_path = []
         self.class_images_path = []
 
-        for concept in concepts_list:
-            inst_img_path = [(x, concept["instance_prompt"]) for x in Path(concept["instance_data_dir"]).iterdir() if x.is_file()]
-            self.instance_images_path.extend(inst_img_path)
+        inst_img_path = [(x, concept["instance_prompt"]) for x in Path(concept["instance_data_dir"]).iterdir() if x.is_file()]
+        self.instance_images_path.extend(inst_img_path)
 
-            if with_prior_preservation:
-                class_img_path = [(x, concept["class_prompt"]) for x in Path(concept["class_data_dir"]).iterdir() if x.is_file()]
-                self.class_images_path.extend(class_img_path[:num_class_images])
+        if with_prior_preservation:
+            class_img_path = [(x, concept["class_prompt"]) for x in Path(concept["class_data_dir"]).iterdir() if x.is_file()]
+            self.class_images_path.extend(class_img_path[:num_class_images])
 
         random.shuffle(self.instance_images_path)
         self.num_instance_images = len(self.instance_images_path)
         self.num_class_images = len(self.class_images_path)
         self._length = max(self.num_class_images, self.num_instance_images)
+    
+    def preprocess(self, image):
+        import numpy as np
+        from diffusers.utils import PIL_INTERPOLATION
 
-        self.image_transforms = transforms.Compose(
-            [
-                transforms.RandomHorizontalFlip(0.5 * hflip),
-                transforms.Resize(size, interpolation=transforms.InterpolationMode.BILINEAR),
-                transforms.CenterCrop(size) if center_crop else transforms.RandomCrop(size),
-                transforms.ToTensor(),
-                transforms.Normalize([0.5], [0.5]),
-            ]
-        )
+        if isinstance(image, torch.Tensor):
+            return image
+        elif isinstance(image, PIL.Image.Image):
+            image = [image]
 
+        if isinstance(image[0], PIL.Image.Image):
+            w, h = image[0].size
+            w, h = map(lambda x: x - x % 32, (w, h))  # resize to integer multiple of 32
+            image = [np.array(i.resize((w, h), resample=PIL_INTERPOLATION["lanczos"]))[None, :] for i in image]
+            image = np.concatenate(image, axis=0)
+            image = np.array(image).astype(np.float32) / 255.0
+            image = image.transpose(0, 3, 1, 2)
+            image = 2.0 * image - 1.0
+            image = torch.from_numpy(image)
+        elif isinstance(image[0], torch.Tensor):
+            image = torch.cat(image, dim=0)
+        return image
+    
     def __len__(self):
         return self._length
 
@@ -330,23 +324,32 @@ class DreamBoothDataset(Dataset):
         instance_image = Image.open(instance_path)
         if not instance_image.mode == "RGB":
             instance_image = instance_image.convert("RGB")
-        example["instance_images"] = self.image_transforms(instance_image)
+
+        # ADAPTED: Added not transformed instance image
+        depth_map_pixel_values = self.feature_extractor(images=instance_image, return_tensors="pt").pixel_values[0]
+
+        example["instance_images"] = self.preprocess(instance_image)[0]
+        example["instance_depth_maps"] = depth_map_pixel_values
         example["instance_prompt_ids"] = self.tokenizer(
             instance_prompt,
-            padding="max_length" if self.pad_tokens else "do_not_pad",
+            padding="do_not_pad",
             truncation=True,
             max_length=self.tokenizer.model_max_length,
         ).input_ids
-
+        
         if self.with_prior_preservation:
             class_path, class_prompt = self.class_images_path[index % self.num_class_images]
             class_image = Image.open(class_path)
             if not class_image.mode == "RGB":
                 class_image = class_image.convert("RGB")
-            example["class_images"] = self.image_transforms(class_image)
+
+            depth_map_pixel_values = self.feature_extractor(images=class_image, return_tensors="pt").pixel_values[0]
+
+            example["class_images"] = self.preprocess(class_image)[0]
+            example["class_depth_maps"] = depth_map_pixel_values
             example["class_prompt_ids"] = self.tokenizer(
                 class_prompt,
-                padding="max_length" if self.pad_tokens else "do_not_pad",
+                padding="do_not_pad",
                 truncation=True,
                 max_length=self.tokenizer.model_max_length,
             ).input_ids
@@ -372,15 +375,16 @@ class PromptDataset(Dataset):
 
 
 class LatentsDataset(Dataset):
-    def __init__(self, latents_cache, text_encoder_cache):
+    def __init__(self, latents_cache, text_encoder_cache, depth_maps_cache):
         self.latents_cache = latents_cache
         self.text_encoder_cache = text_encoder_cache
+        self.depth_maps_cache = depth_maps_cache
 
     def __len__(self):
         return len(self.latents_cache)
 
     def __getitem__(self, index):
-        return self.latents_cache[index], self.text_encoder_cache[index]
+        return self.latents_cache[index], self.text_encoder_cache[index], self.depth_maps_cache[index]
 
 
 class AverageMeter:
@@ -408,16 +412,9 @@ def get_full_repo_name(model_id: str, organization: Optional[str] = None, token:
 
 
 def main(args):
-    run = wandb.init(project=args.wandb_project_name, group=args.wandb_group_name, job_type="train")
-    wandb.config.update(args)
-
-    logging_dir = Path(args.output_dir, "0", args.logging_dir)
-
     accelerator = Accelerator(
         gradient_accumulation_steps=args.gradient_accumulation_steps,
         mixed_precision=args.mixed_precision,
-        log_with="wandb",
-        logging_dir=logging_dir,
     )
 
     # Currently, it's not possible to do gradient accumulation when training two models with accelerate.accumulate
@@ -429,100 +426,112 @@ def main(args):
             "Please set gradient_accumulation_steps to 1. This feature will be supported in the future."
         )
 
-    if args.seed is not None:
-        set_seed(args.seed)
+    # Set seed for reproducible training
+    set_seed(args.seed)
 
-    if args.concepts_list is None:
-        args.concepts_list = [
-            {
-                "instance_prompt": args.instance_prompt,
-                "class_prompt": args.class_prompt,
-                "instance_data_dir": args.instance_data_dir,
-                "class_data_dir": args.class_data_dir
-            }
-        ]
-    else:
-        with open(args.concepts_list, "r") as f:
-            args.concepts_list = json.load(f)
+    # Define concept that will be learned
+    concept = {
+        "instance_prompt": args.instance_prompt,
+        "class_prompt": args.class_prompt,
+        "instance_data_dir": args.instance_data_dir,
+        "class_data_dir": args.class_data_dir
+    }
 
+    # Create images for prior preservation.
+    # Images are only created when the args.class_data_dir does not contain any or less than args.num_class_images
+    # To create the images a pipeline with the base model is created and inference is run
     if args.with_prior_preservation:
         pipeline = None
-        for concept in args.concepts_list:
-            class_images_dir = Path(concept["class_data_dir"])
-            class_images_dir.mkdir(parents=True, exist_ok=True)
-            cur_class_images = len(list(class_images_dir.iterdir()))
+        class_images_dir = Path(concept["class_data_dir"])
+        class_images_dir.mkdir(parents=True, exist_ok=True)
+        cur_class_images = len(list(class_images_dir.iterdir()))
 
-            if cur_class_images < args.num_class_images:
-                torch_dtype = torch.float16 if accelerator.device.type == "cuda" else torch.float32
-                if pipeline is None:
-                    pipeline = StableDiffusionPipeline.from_pretrained(
-                        args.pretrained_model_name_or_path,
-                        vae=AutoencoderKL.from_pretrained(
-                            args.pretrained_vae_name_or_path,
-                            subfolder=None,
-                            revision=None,
-                            torch_dtype=torch_dtype
-                        ),
-                        torch_dtype=torch_dtype,
-                        safety_checker=None,
-                        revision=args.revision
-                    )
-                    pipeline.set_progress_bar_config(disable=True)
-                    pipeline.to(accelerator.device)
+        if cur_class_images < args.num_class_images:
+            torch_dtype = torch.float16 if accelerator.device.type == "cuda" else torch.float32
+            if pipeline is None:
+                # Note, here we use the better Variational Autoencoder for Inference!
+                pipeline = StableDiffusionPipeline.from_pretrained(
+                    args.pretrained_base_model_path,
+                    vae=AutoencoderKL.from_pretrained(
+                        args.pretrained_vae_path,
+                        subfolder=None,
+                        revision=None,
+                        torch_dtype=torch_dtype
+                    ),
+                    torch_dtype=torch_dtype,
+                    safety_checker=None,
+                    revision=args.revision
+                )
+                pipeline.set_progress_bar_config(disable=True)
+                pipeline.to(accelerator.device)
 
-                num_new_images = args.num_class_images - cur_class_images
-                logger.info(f"Number of class images to sample: {num_new_images}.")
+            num_new_images = args.num_class_images - cur_class_images
 
-                sample_dataset = PromptDataset(concept["class_prompt"], num_new_images)
-                sample_dataloader = torch.utils.data.DataLoader(sample_dataset, batch_size=args.sample_batch_size)
+            class_dataset = PromptDataset(concept["class_prompt"], num_new_images)
+            class_dataloader = torch.utils.data.DataLoader(class_dataset, batch_size=args.class_batch_size)
 
-                sample_dataloader = accelerator.prepare(sample_dataloader)
+            class_dataloader = accelerator.prepare(class_dataloader)
 
-                with torch.autocast("cuda"), torch.inference_mode():
-                    for example in tqdm(
-                        sample_dataloader, desc="Generating class images", disable=not accelerator.is_local_main_process
-                    ):
-                        images = pipeline(example["prompt"]).images
+            with torch.autocast("cuda"), torch.inference_mode():
+                for example in tqdm(
+                    class_dataloader, 
+                    desc="Generating class images", 
+                    disable=not accelerator.is_local_main_process):
+                    images = pipeline(
+                            prompt = example["prompt"], 
+                            num_inference_steps=50).images
 
-                        for i, image in enumerate(images):
-                            hash_image = hashlib.sha1(image.tobytes()).hexdigest()
-                            image_filename = class_images_dir / f"{example['index'][i] + cur_class_images}-{hash_image}.jpg"
-                            image.save(image_filename)
+                    for i, image in enumerate(images):
+                        hash_image = hashlib.sha1(image.tobytes()).hexdigest()
+                        image_filename = class_images_dir / f"{example['index'][i] + cur_class_images}-{hash_image}.jpg"
+                        image.save(image_filename)
 
         del pipeline
         if torch.cuda.is_available():
             torch.cuda.empty_cache()
 
+    # Get Width and Height of images
+    filename = os.listdir(class_images_dir)[0]
+    image = Image.open(os.path.join(class_images_dir, filename))
+    WIDTH, HEIGHT = image.size
+        
     # Load the tokenizer
-    if args.tokenizer_name:
-        tokenizer = CLIPTokenizer.from_pretrained(
-            args.tokenizer_name,
-            revision=args.revision,
-        )
-    elif args.pretrained_model_name_or_path:
-        tokenizer = CLIPTokenizer.from_pretrained(
-            args.pretrained_model_name_or_path,
-            subfolder="tokenizer",
-            revision=args.revision,
-        )
+    tokenizer = CLIPTokenizer.from_pretrained(
+        args.pretrained_depth_model_path,
+        subfolder="tokenizer",
+        revision=args.revision,
+    )
 
     # Load models and create wrapper for stable diffusion
     text_encoder = CLIPTextModel.from_pretrained(
-        args.pretrained_model_name_or_path,
+        args.pretrained_depth_model_path,
         subfolder="text_encoder",
         revision=args.revision,
     )
     vae = AutoencoderKL.from_pretrained(
-        args.pretrained_model_name_or_path,
+        args.pretrained_depth_model_path,
         subfolder="vae",
         revision=args.revision,
     )
     unet = UNet2DConditionModel.from_pretrained(
-        args.pretrained_model_name_or_path,
+        args.pretrained_depth_model_path,
         subfolder="unet",
         revision=args.revision,
         torch_dtype=torch.float32
     )
+    # ADAPTED: Added feature extractor and depth estimator
+    # Check repo structure here: https://huggingface.co/stabilityai/stable-diffusion-2-depth/tree/main
+    from diffusers import DiffusionPipeline
+    pipeline = DiffusionPipeline.from_pretrained(args.pretrained_depth_model_path)
+    feature_extractor = pipeline.feature_extractor
+
+    depth_estimator = DPTForDepthEstimation.from_pretrained(
+        args.pretrained_depth_model_path,
+        subfolder="depth_estimator",
+        revision=args.revision,
+    )
+    vae_scale_factor = 2 ** (len(vae.config.block_out_channels) - 1)
+
 
     vae.requires_grad_(False)
     if not args.train_text_encoder:
@@ -532,11 +541,6 @@ def main(args):
         unet.enable_gradient_checkpointing()
         if args.train_text_encoder:
             text_encoder.gradient_checkpointing_enable()
-
-    if args.scale_lr:
-        args.learning_rate = (
-            args.learning_rate * args.gradient_accumulation_steps * args.train_batch_size * accelerator.num_processes
-        )
 
     # Use 8-bit Adam for lower memory usage or to fine-tune the model in 16GB GPUs
     if args.use_8bit_adam:
@@ -554,39 +558,75 @@ def main(args):
     params_to_optimize = (
         itertools.chain(unet.parameters(), text_encoder.parameters()) if args.train_text_encoder else unet.parameters()
     )
+
     optimizer = optimizer_class(
         params_to_optimize,
         lr=args.learning_rate,
-        betas=(args.adam_beta1, args.adam_beta2),
-        weight_decay=args.adam_weight_decay,
-        eps=args.adam_epsilon,
+        betas=(0.9, 0.999),
+        weight_decay=1e-2,
+        eps=1e-08,
     )
 
-    noise_scheduler = DDPMScheduler.from_config(args.pretrained_model_name_or_path, subfolder="scheduler")
+    noise_scheduler = DDPMScheduler.from_config(args.pretrained_depth_model_path, subfolder="scheduler")
 
     train_dataset = DreamBoothDataset(
-        concepts_list=args.concepts_list,
+        concept=concept,
         tokenizer=tokenizer,
         with_prior_preservation=args.with_prior_preservation,
-        size=args.resolution,
-        center_crop=args.center_crop,
         num_class_images=args.num_class_images,
-        pad_tokens=args.pad_tokens,
-        hflip=args.hflip
+        feature_extractor=feature_extractor
     )
+
+    def prepare_depth_map(pixel_values, depth_map, device, dtype, width, height):
+        """ Extract and prepare depth map. If no depth map is specified it will be extracted from pixel_values"""
+        if depth_map is None:
+            #pixel_values = feature_extractor(images=image, return_tensors="pt").pixel_values
+            #pixel_values = pixel_values.to(device=device)
+            # The DPT-Hybrid model uses batch-norm layers which are not compatible with fp16.
+            # So we use `torch.autocast` here for half precision inference.
+            context_manger = torch.autocast("cuda", dtype=dtype) if device.type == "cuda" else contextlib.nullcontext()
+            with context_manger:
+                depth_map = depth_estimator(pixel_values).predicted_depth
+        else:
+            depth_map = depth_map.to(dtype=dtype)
+
+        depth_map = torch.nn.functional.interpolate(
+            depth_map.unsqueeze(1),
+            size=(height // vae_scale_factor, width // vae_scale_factor),
+            mode="bicubic",
+            align_corners=False,
+        )
+
+        depth_min = torch.amin(depth_map, dim=[1, 2, 3], keepdim=True)
+        depth_max = torch.amax(depth_map, dim=[1, 2, 3], keepdim=True)
+        depth_map = 2.0 * (depth_map - depth_min) / (depth_max - depth_min) - 1.0
+        depth_map = depth_map.to(dtype)
+
+        return depth_map
+    
+    weight_dtype = torch.float32
+    if args.mixed_precision == "fp16":
+        weight_dtype = torch.float16
+    elif args.mixed_precision == "bf16":
+        weight_dtype = torch.bfloat16
 
     def collate_fn(examples):
         input_ids = [example["instance_prompt_ids"] for example in examples]
         pixel_values = [example["instance_images"] for example in examples]
+        depth_maps = [example["instance_depth_maps"] for example in examples]
 
         # Concat class and instance examples for prior preservation.
         # We do this to avoid doing two forward passes.
         if args.with_prior_preservation:
             input_ids += [example["class_prompt_ids"] for example in examples]
             pixel_values += [example["class_images"] for example in examples]
+            depth_maps += [example["class_depth_maps"] for example in examples]
 
         pixel_values = torch.stack(pixel_values)
         pixel_values = pixel_values.to(memory_format=torch.contiguous_format).float()
+
+        depth_maps = torch.stack(depth_maps)
+        depth_maps = depth_maps.to(memory_format=torch.contiguous_format).float()
 
         input_ids = tokenizer.pad(
             {"input_ids": input_ids},
@@ -597,18 +637,13 @@ def main(args):
         batch = {
             "input_ids": input_ids,
             "pixel_values": pixel_values,
+            "depth_maps": depth_maps
         }
         return batch
 
     train_dataloader = torch.utils.data.DataLoader(
-        train_dataset, batch_size=args.train_batch_size, shuffle=True, collate_fn=collate_fn, pin_memory=True
+        train_dataset, batch_size=args.train_batch_size, shuffle=True, collate_fn=collate_fn, pin_memory=True, num_workers=8
     )
-
-    weight_dtype = torch.float32
-    if args.mixed_precision == "fp16":
-        weight_dtype = torch.float16
-    elif args.mixed_precision == "bf16":
-        weight_dtype = torch.bfloat16
 
     # Move text_encode and vae to gpu.
     # For mixed precision training we cast the text_encoder and vae weights to half-precision
@@ -617,19 +652,28 @@ def main(args):
     if not args.train_text_encoder:
         text_encoder.to(accelerator.device, dtype=weight_dtype)
 
+    depth_estimator.to(accelerator.device, dtype=weight_dtype)
+
     if not args.not_cache_latents:
         latents_cache = []
         text_encoder_cache = []
+        # ADAPTED:
+        depth_maps_cache = []
         for batch in tqdm(train_dataloader, desc="Caching latents"):
             with torch.no_grad():
                 batch["pixel_values"] = batch["pixel_values"].to(accelerator.device, non_blocking=True, dtype=weight_dtype)
                 batch["input_ids"] = batch["input_ids"].to(accelerator.device, non_blocking=True)
+                batch["depth_maps"] = batch["depth_maps"].to(accelerator.device, non_blocking=True, dtype=weight_dtype)
                 latents_cache.append(vae.encode(batch["pixel_values"]).latent_dist)
                 if args.train_text_encoder:
                     text_encoder_cache.append(batch["input_ids"])
                 else:
                     text_encoder_cache.append(text_encoder(batch["input_ids"])[0])
-        train_dataset = LatentsDataset(latents_cache, text_encoder_cache)
+
+                # ADAPTED: Add depth_maps here
+                depth_maps_cache.append(prepare_depth_map(pixel_values=batch["depth_maps"], depth_map=None, device=accelerator.device, dtype=weight_dtype, width=WIDTH, height=HEIGHT))
+       
+        train_dataset = LatentsDataset(latents_cache, text_encoder_cache, depth_maps_cache)
         train_dataloader = torch.utils.data.DataLoader(train_dataset, batch_size=1, collate_fn=lambda x: x, shuffle=True)
 
         del vae
@@ -637,13 +681,6 @@ def main(args):
             del text_encoder
         if torch.cuda.is_available():
             torch.cuda.empty_cache()
-
-    # Scheduler and math around the number of training steps.
-    overrode_max_train_steps = False
-    num_update_steps_per_epoch = math.ceil(len(train_dataloader) / args.gradient_accumulation_steps)
-    if args.max_train_steps is None:
-        args.max_train_steps = args.num_train_epochs * num_update_steps_per_epoch
-        overrode_max_train_steps = True
 
     lr_scheduler = get_scheduler(
         args.lr_scheduler,
@@ -653,52 +690,42 @@ def main(args):
     )
 
     if args.train_text_encoder:
-        unet, text_encoder, optimizer, train_dataloader, lr_scheduler = accelerator.prepare(
-            unet, text_encoder, optimizer, train_dataloader, lr_scheduler
+        unet, text_encoder, optimizer, train_dataloader, lr_scheduler, depth_estimator, feature_extractor = accelerator.prepare(
+            unet, text_encoder, optimizer, train_dataloader, lr_scheduler, depth_estimator, feature_extractor
         )
     else:
-        unet, optimizer, train_dataloader, lr_scheduler = accelerator.prepare(
-            unet, optimizer, train_dataloader, lr_scheduler
+        unet, optimizer, train_dataloader, lr_scheduler, depth_estimator, feature_extractor = accelerator.prepare(
+            unet, optimizer, train_dataloader, lr_scheduler, depth_estimator, feature_extractor
         )
 
     # We need to recalculate our total training steps as the size of the training dataloader may have changed.
     num_update_steps_per_epoch = math.ceil(len(train_dataloader) / args.gradient_accumulation_steps)
-    if overrode_max_train_steps:
-        args.max_train_steps = args.num_train_epochs * num_update_steps_per_epoch
+    
     # Afterwards we recalculate our number of training epochs
-    args.num_train_epochs = math.ceil(args.max_train_steps / num_update_steps_per_epoch)
+    num_train_epochs = math.ceil(args.max_train_steps / num_update_steps_per_epoch)
 
     # We need to initialize the trackers we use, and also store our configuration.
     # The trackers initializes automatically on the main process.
     if accelerator.is_main_process:
         accelerator.init_trackers("dreambooth")
 
-    # Train!
-    total_batch_size = args.train_batch_size * accelerator.num_processes * args.gradient_accumulation_steps
-
-    logger.info("***** Running training *****")
-    logger.info(f"  Num examples = {len(train_dataset)}")
-    logger.info(f"  Num batches each epoch = {len(train_dataloader)}")
-    logger.info(f"  Num Epochs = {args.num_train_epochs}")
-    logger.info(f"  Instantaneous batch size per device = {args.train_batch_size}")
-    logger.info(f"  Total train batch size (w. parallel, distributed & accumulation) = {total_batch_size}")
-    logger.info(f"  Gradient Accumulation steps = {args.gradient_accumulation_steps}")
-    logger.info(f"  Total optimization steps = {args.max_train_steps}")
-
-    def save_weights(step):
+    def save_weights():
+        """Save the weights of finished training to args.model_output_directory"""
         # Create the pipeline using using the trained modules and save it.
         if accelerator.is_main_process:
             if args.train_text_encoder:
                 text_enc_model = accelerator.unwrap_model(text_encoder)
             else:
-                text_enc_model = CLIPTextModel.from_pretrained(args.pretrained_model_name_or_path, subfolder="text_encoder", revision=args.revision)
+                text_enc_model = CLIPTextModel.from_pretrained(args.pretrained_depth_model_path, subfolder="text_encoder", revision=args.revision)
             scheduler = DDIMScheduler(beta_start=0.00085, beta_end=0.012, beta_schedule="scaled_linear", clip_sample=False, set_alpha_to_one=False)
-            pipeline = StableDiffusionPipeline.from_pretrained(
-                args.pretrained_model_name_or_path,
+            # ADAPTED: Changed StableDiffusionPipeline to StableDiffusionDepth2ImgPipeline
+            pipeline = StableDiffusionDepth2ImgPipeline.from_pretrained(
+                # MAYBE: The author also moved unwarp_model(unet).to(torch.float16) and text_enc_model.to(torch.float16)
+                args.pretrained_depth_model_path,
                 unet=accelerator.unwrap_model(unet),
                 text_encoder=text_enc_model,
                 vae=AutoencoderKL.from_pretrained(
-                    args.pretrained_vae_name_or_path,
+                    args.pretrained_vae_path,
                     subfolder=None,
                     revision=None,
                 ),
@@ -707,42 +734,24 @@ def main(args):
                 torch_dtype=torch.float16,
                 revision=args.revision,
             )
-            save_dir = os.path.join(args.output_dir, f"{step}")
+            save_dir = os.path.join(args.model_output_dir)
             pipeline.save_pretrained(save_dir)
             with open(os.path.join(save_dir, "args.json"), "w") as f:
                 json.dump(args.__dict__, f, indent=2)
 
-            if args.save_sample_prompt is not None:
-                pipeline = pipeline.to(accelerator.device)
-                g_cuda = torch.Generator(device=accelerator.device).manual_seed(args.seed)
-                pipeline.set_progress_bar_config(disable=True)
-                sample_dir = os.path.join(save_dir, "samples")
-                os.makedirs(sample_dir, exist_ok=True)
-                with torch.autocast("cuda"), torch.inference_mode():
-                    for i in tqdm(range(args.n_save_sample), desc="Generating samples"):
-                        images = pipeline(
-                            args.save_sample_prompt,
-                            negative_prompt=args.save_sample_negative_prompt,
-                            guidance_scale=args.save_guidance_scale,
-                            num_inference_steps=args.save_infer_steps,
-                            generator=g_cuda
-                        ).images
-                        images[0].save(os.path.join(sample_dir, f"{i}.png"))
-                del pipeline
-                if torch.cuda.is_available():
-                    torch.cuda.empty_cache()
-            print(f"[*] Weights saved at {save_dir}")
-
+    # Train!
     # Only show the progress bar once on each machine.
     progress_bar = tqdm(range(args.max_train_steps), disable=not accelerator.is_local_main_process)
     progress_bar.set_description("Steps")
     global_step = 0
     loss_avg = AverageMeter()
     text_enc_context = nullcontext() if args.train_text_encoder else torch.no_grad()
-    for epoch in range(args.num_train_epochs):
+    for epoch in range(num_train_epochs):
         unet.train()
         if args.train_text_encoder:
             text_encoder.train()
+        if args.not_cache_latents:
+            random.shuffle(train_dataset.class_images_path)
         for step, batch in enumerate(train_dataloader):
             with accelerator.accumulate(unet):
                 # Convert images to latent space
@@ -763,7 +772,15 @@ def main(args):
                 # Add noise to the latents according to the noise magnitude at each timestep
                 # (this is the forward diffusion process)
                 noisy_latents = noise_scheduler.add_noise(latents, noise, timesteps)
-
+                
+                with torch.no_grad():
+                    if not args.not_cache_latents:
+                        depth_masks = batch[0][2]
+                    else:
+                        depth_masks = prepare_depth_map(pixel_values=batch["depth_maps"], depth_map=None, device=accelerator.device, dtype=weight_dtype, width=WIDTH, height=HEIGHT)                
+                
+                # Prepare depth mask using image, 
+                latent_model_input = torch.cat([noisy_latents, depth_masks], dim=1)
                 # Get the text embedding for conditioning
                 with text_enc_context:
                     if not args.not_cache_latents:
@@ -775,7 +792,7 @@ def main(args):
                         encoder_hidden_states = text_encoder(batch["input_ids"])[0]
 
                 # Predict the noise residual
-                noise_pred = unet(noisy_latents, timesteps, encoder_hidden_states).sample
+                noise_pred = unet(latent_model_input, timesteps, encoder_hidden_states).sample
 
                 if args.with_prior_preservation:
                     # Chunk the noise and noise_pred into two parts and compute the loss on each part separately.
@@ -794,13 +811,6 @@ def main(args):
                     loss = F.mse_loss(noise_pred.float(), noise.float(), reduction="mean")
 
                 accelerator.backward(loss)
-                # if accelerator.sync_gradients:
-                #     params_to_clip = (
-                #         itertools.chain(unet.parameters(), text_encoder.parameters())
-                #         if args.train_text_encoder
-                #         else unet.parameters()
-                #     )
-                #     accelerator.clip_grad_norm_(params_to_clip, args.max_grad_norm)
                 optimizer.step()
                 lr_scheduler.step()
                 optimizer.zero_grad(set_to_none=True)
@@ -811,9 +821,6 @@ def main(args):
                 progress_bar.set_postfix(**logs)
                 accelerator.log(logs, step=global_step)
 
-            if global_step > 0 and not global_step % args.save_interval and global_step >= args.save_min_steps:
-                save_weights(global_step)
-
             progress_bar.update(1)
             global_step += 1
 
@@ -822,7 +829,7 @@ def main(args):
 
         accelerator.wait_for_everyone()
 
-    save_weights(global_step)
+    save_weights()
 
     accelerator.end_training()
 
