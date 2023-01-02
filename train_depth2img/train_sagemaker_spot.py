@@ -76,7 +76,7 @@ def parse_args(input_args=None):
     parser.add_argument(
         "--model_output_dir",
         type=str,
-        default=os.environ["SM_MODEL_DIR"],
+        default="",
         help="The output directory where the final model will be written to.",
     )
     parser.add_argument(
@@ -125,14 +125,14 @@ def parse_args(input_args=None):
     parser.add_argument(
         "--instance_data_dir",
         type=str,
-        default=os.environ["SM_CHANNEL_TRAIN"],
+        default="",
         help="A folder containing the training data of instance images.",
     )
 
     parser.add_argument(
         "--class_data_dir",
         type=str,
-        default=os.environ["SM_CHANNEL_TEST"],
+        default="",
         help="A folder containing the training data of class images.",
     )
 
@@ -505,9 +505,6 @@ def main(args):
             "Gradient accumulation is not supported when training the text encoder in distributed training. "
             "Please set gradient_accumulation_steps to 1. This feature will be supported in the future."
         )
-
-    environment_variables = os.environ
-    logger.info("Environment variables", environment_variables)
 
     # Set seed for reproducible training
     set_seed(args.seed)
