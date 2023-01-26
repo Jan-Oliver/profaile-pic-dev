@@ -17,9 +17,6 @@ from contextlib import nullcontext
 from pathlib import Path
 from typing import Optional
 
-import boto3
-import sagemaker
-from sagemaker import get_execution_role
 import torch
 import torch.nn.functional as F
 import torch.utils.checkpoint
@@ -54,7 +51,7 @@ def parse_args(input_args=None):
         help="The output directory where the final model will be written to.",
     )
     parser.add_argument(
-        "--pretrained_depth_model_path",
+        "--pretrained_base_model_path",
         type=str,
         default="stabilityai/stable-diffusion-2-1-base",
         required=False,
@@ -403,7 +400,7 @@ def main(args):
         "instance_data_dir": args.instance_data_dir,
         "class_data_dir": args.class_data_dir
     }
-    
+
     # Create images for prior preservation.
     # Images are only created when the args.class_data_dir does not contain any or less than args.num_class_images
     # To create the images a pipeline with the base model is created and inference is run
@@ -471,7 +468,7 @@ def main(args):
         checkpoint_epoch = int(folders[-1])
         logger.info(
             f"***** continue training from checkpoint {checkpoint_epoch} *****")
-        args.pretrained_depth_model_path = os.path.join(
+        args.pretrained_base_model_path = os.path.join(
             args.model_checkpoint_dir, str(checkpoint_epoch))
     else:
         logger.info(f"***** training from original pretrained model *****")
@@ -479,24 +476,24 @@ def main(args):
 
     # Load the tokenizer
     tokenizer = CLIPTokenizer.from_pretrained(
-        args.pretrained_depth_model_path,
+        args.pretrained_base_model_path,
         subfolder="tokenizer",
         revision=args.revision,
     )
 
     # Load models and create wrapper for stable diffusion
     text_encoder = CLIPTextModel.from_pretrained(
-        args.pretrained_depth_model_path,
+        args.pretrained_base_model_path,
         subfolder="text_encoder",
         revision=args.revision,
     )
     vae = AutoencoderKL.from_pretrained(
-        args.pretrained_depth_model_path,
+        args.pretrained_base_model_path,
         subfolder="vae",
         revision=args.revision,
     )
     unet = UNet2DConditionModel.from_pretrained(
-        args.pretrained_depth_model_path,
+        args.pretrained_base_model_path,
         subfolder="unet",
         revision=args.revision,
         torch_dtype=torch.float32
@@ -540,7 +537,7 @@ def main(args):
     )
 
     noise_scheduler = DDPMScheduler.from_config(
-        args.pretrained_depth_model_path, subfolder="scheduler")
+        args.pretrained_base_model_path, subfolder="scheduler")
 
     train_dataset = DreamBoothDataset(
         concept=concept,
@@ -656,13 +653,13 @@ def main(args):
                 text_enc_model = accelerator.unwrap_model(text_encoder)
             else:
                 text_enc_model = CLIPTextModel.from_pretrained(
-                    args.pretrained_depth_model_path, subfolder="text_encoder", revision=args.revision)
+                    args.pretrained_base_model_path, subfolder="text_encoder", revision=args.revision)
             scheduler = DDIMScheduler(beta_start=0.00085, beta_end=0.012,
                                       beta_schedule="scaled_linear", clip_sample=False, set_alpha_to_one=False)
 
             pipeline = StableDiffusionPipeline.from_pretrained(
                 # MAYBE: The author also moved unwarp_model(unet).to(torch.float16) and text_enc_model.to(torch.float16)
-                args.pretrained_depth_model_path,
+                args.pretrained_base_model_path,
                 unet=accelerator.unwrap_model(unet),
                 text_encoder=text_enc_model,
                 vae=AutoencoderKL.from_pretrained(
@@ -692,12 +689,12 @@ def main(args):
                 text_enc_model = accelerator.unwrap_model(text_encoder)
             else:
                 text_enc_model = CLIPTextModel.from_pretrained(
-                    args.pretrained_depth_model_path, subfolder="text_encoder", revision=args.revision)
+                    args.pretrained_base_model_path, subfolder="text_encoder", revision=args.revision)
             scheduler = DDIMScheduler(beta_start=0.00085, beta_end=0.012,
                                       beta_schedule="scaled_linear", clip_sample=False, set_alpha_to_one=False)
 
             pipeline = StableDiffusionPipeline.from_pretrained(
-                args.pretrained_depth_model_path,
+                args.pretrained_base_model_path,
                 unet=accelerator.unwrap_model(unet),
                 text_encoder=text_enc_model,
                 vae=AutoencoderKL.from_pretrained(
