@@ -403,6 +403,59 @@ def main(args):
         "instance_data_dir": args.instance_data_dir,
         "class_data_dir": args.class_data_dir
     }
+    
+    # Create images for prior preservation.
+    # Images are only created when the args.class_data_dir does not contain any or less than args.num_class_images
+    # To create the images a pipeline with the base model is created and inference is run
+    if args.with_prior_preservation:
+        pipeline = None
+        class_images_dir = Path(concept["class_data_dir"])
+        class_images_dir.mkdir(parents=True, exist_ok=True)
+        cur_class_images = len(list(class_images_dir.iterdir()))
+
+        if cur_class_images < args.num_class_images:
+            torch_dtype = torch.float16 if accelerator.device.type == "cuda" else torch.float32
+            if pipeline is None:
+                # Note, here we use the better Variational Autoencoder for Inference!
+                pipeline = StableDiffusionPipeline.from_pretrained(
+                    args.pretrained_base_model_path,
+                    vae=AutoencoderKL.from_pretrained(
+                        args.pretrained_vae_path,
+                        subfolder=None,
+                        revision=None,
+                        torch_dtype=torch_dtype
+                    ),
+                    torch_dtype=torch_dtype,
+                    safety_checker=None,
+                    revision=args.revision
+                )
+                pipeline.set_progress_bar_config(disable=True)
+                pipeline.to(accelerator.device)
+
+            num_new_images = args.num_class_images - cur_class_images
+
+            class_dataset = PromptDataset(concept["class_prompt"], num_new_images)
+            class_dataloader = torch.utils.data.DataLoader(class_dataset, batch_size=args.class_batch_size)
+
+            class_dataloader = accelerator.prepare(class_dataloader)
+
+            with torch.autocast("cuda"), torch.inference_mode():
+                for example in tqdm(
+                    class_dataloader, 
+                    desc="Generating class images", 
+                    disable=not accelerator.is_local_main_process):
+                    images = pipeline(
+                            prompt = example["prompt"], 
+                            num_inference_steps=50).images
+
+                    for i, image in enumerate(images):
+                        hash_image = hashlib.sha1(image.tobytes()).hexdigest()
+                        image_filename = class_images_dir / f"{example['index'][i] + cur_class_images}-{hash_image}.jpg"
+                        image.save(image_filename)
+
+        del pipeline
+        if torch.cuda.is_available():
+            torch.cuda.empty_cache()
 
     class_images_dir = Path(concept["class_data_dir"])
 
