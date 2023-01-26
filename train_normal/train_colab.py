@@ -1,7 +1,6 @@
 import argparse
 import logging
 import os
-os.environ['KMP_DUPLICATE_LIB_OK']='True'
 import hashlib
 import itertools
 import contextlib
@@ -291,7 +290,7 @@ class DreamBoothDataset(Dataset):
         if not instance_image.mode == "RGB":
             instance_image = instance_image.convert("RGB")
 
-        example["instance_images"] = self.preprocess(instance_image)[0]
+        example["instance_images"] = self.image_transforms(instance_image)
         example["instance_prompt_ids"] = self.tokenizer(
             instance_prompt,
             padding='max_length',
@@ -306,7 +305,7 @@ class DreamBoothDataset(Dataset):
             if not class_image.mode == "RGB":
                 class_image = class_image.convert("RGB")
 
-            example["class_images"] = self.preprocess(class_image)[0]
+            example["class_images"] = self.image_transforms(class_image)
             example["class_prompt_ids"] = self.tokenizer(
                 class_prompt,
                 padding='max_length',
